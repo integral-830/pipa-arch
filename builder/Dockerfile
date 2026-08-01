@@ -25,7 +25,7 @@ WORKDIR /build
 COPY . /build/
 
 # Make scripts executable
-RUN chmod +x *.sh
+RUN chmod +x ./*.sh
 
 CMD []
 ENTRYPOINT ["/bin/bash", "./build-image.sh"]
