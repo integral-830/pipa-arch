@@ -307,7 +307,14 @@ if [ "$PIPA_INCLUDE_EXTRAS" = "1" ]; then
     echo "### Installing optional pipa-alarm extras when available..."
     OPTIONAL_INSTALL=()
     for pkg in "${PIPA_ALARM_EXTRA_PACKAGES[@]}"; do
-        if pacman -C "$PACMAN_CONF" -Si "${PIPA_ALARM_REPO_NAME}/${pkg}" >/dev/null 2>&1; then
+        # pacstrap already synced every repo in $PACMAN_CONF -- including
+        # pipa-alarm -- into $ROOTFS_DIR's own dbpath above. Without
+        # -r "$ROOTFS_DIR" here, this queries the *host's* dbpath instead,
+        # which has no pipa-alarm.db at all (that repo only exists in this
+        # ad-hoc conf, not the base image's own /etc/pacman.conf), so every
+        # package here would be reported "not found" and skipped
+        # unconditionally, regardless of what pipa-alarm actually publishes.
+        if pacman -C "$PACMAN_CONF" -r "$ROOTFS_DIR" -Si "${PIPA_ALARM_REPO_NAME}/${pkg}" >/dev/null 2>&1; then
             OPTIONAL_INSTALL+=("${PIPA_ALARM_REPO_NAME}/${pkg}")
         else
             echo "Skipping optional package (not currently in pipa-alarm repo): $pkg"
