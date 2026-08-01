@@ -305,6 +305,20 @@ printf '%s\n' "$TARGET_KERNEL_CMDLINE" > "$ROOTFS_DIR/etc/cmdline"
 printf '%s\n' "$TARGET_KERNEL_CMDLINE" > "$ROOTFS_DIR/boot/cmdline.txt"
 write_placeholder_initramfs "$ROOTFS_DIR/boot/initramfs.img"
 
+# pipa-grub-config ships a pacman hook (95-pipa-refresh-grub-config.hook)
+# that fires automatically on every install/upgrade of itself or
+# linux-pipa -- including during pacstrap below, long before the real boot
+# partition exists. Its helper script refuses to run unless /boot is an
+# actual mountpoint ("pipa-grub-config: /boot is not mounted; refusing to
+# write GRUB config"), and a failed pacman hook makes pacman -- and thus
+# pacstrap -- exit non-zero, which aborts this whole script under `set -e`.
+# Self-bind-mounting /boot satisfies that mountpoint check, so the
+# auto-triggered hook becomes a harmless no-op instead of a hard failure.
+# We explicitly regenerate the real GRUB config later, once the actual
+# boot partition is mounted in its place, so anything this early run
+# writes gets discarded anyway.
+mount --bind "$ROOTFS_DIR/boot" "$ROOTFS_DIR/boot"
+
 echo "### Pre-installing pipa-grub-config..."
 # linux-pipa and pipa-grub-config have no declared dependency relationship,
 # and "linux-pipa" alphabetically precedes "pipa-grub-config" -- so in one
@@ -628,6 +642,10 @@ else
     cp "$DTB_IMAGE" "$BOOT_MNT/dtbs/qcom/"
 fi
 printf '%s\n' "$TARGET_KERNEL_CMDLINE" > "$BOOT_MNT/cmdline.txt"
+# Drop the temporary self-bind-mount from earlier (used only so
+# pipa-grub-config's auto-triggered pacman hook wouldn't refuse to run
+# during pacstrap) before putting the real boot partition in its place.
+umount "$ROOTFS_DIR/boot"
 mount --move "$BOOT_MNT" "$ROOTFS_DIR/boot"
 arch-chroot "$ROOTFS_DIR" env \
     PIPA_INITRAMFS_SOURCE="/boot/initramfs-$KERNEL_VER.img" \
