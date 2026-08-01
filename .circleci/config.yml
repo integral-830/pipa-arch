@@ -5,9 +5,17 @@ version: 2.1
 # the default `docker` executor, so full image assembly needs the `machine`
 # executor (a real VM, same reason GitHub Actions ubuntu-latest works for
 # this too). Full builds also take 30-90+ minutes per the README, so they
-# run only via manual approval or the nightly scheduled pipeline, not on
-# every commit.
+# run only via manual approval, the nightly scheduled pipeline, or a tag
+# push (which also cuts a GitHub Release) -- never on every commit.
 # ---------------------------------------------------------------------------
+
+parameters:
+  pipa_include_sensors:
+    type: string
+    default: "1"
+  pipa_include_extras:
+    type: string
+    default: "1"
 
 executors:
   docker-small:
@@ -74,19 +82,71 @@ jobs:
           command: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
       - run:
           name: Free disk space
-          command: docker system prune -af || true
+          command: |
+            df -h /
+            docker system prune -af || true
       - run:
           name: Build << parameters.de >> image
           command: |
             mkdir -p images
-            make << parameters.de >> BUILD_GIT_REV="${CIRCLE_SHA1}"
+            make << parameters.de >> \
+              BUILD_GIT_REV="${CIRCLE_SHA1}" \
+              PIPA_INCLUDE_SENSORS="<< pipeline.parameters.pipa_include_sensors >>" \
+              PIPA_INCLUDE_EXTRAS="<< pipeline.parameters.pipa_include_extras >>"
           no_output_timeout: 90m
       - run:
-          name: Checksum output
-          command: sha256sum images/*.zip || true
+          name: Verify output
+          command: |
+            shopt -s nullglob
+            zips=(images/*.zip)
+            if [ "${#zips[@]}" -eq 0 ]; then
+              echo "No .zip produced in images/ -- build did not complete" >&2
+              exit 1
+            fi
+            for z in "${zips[@]}"; do
+              echo "--- $z ---"
+              unzip -l "$z"
+            done
+      - run:
+          name: Checksum + BUILDINFO
+          command: |
+            cd images
+            sha256sum *.zip | tee SHA256SUMS-<< parameters.de >>.txt
+            for z in *.zip; do
+              unzip -p "$z" BUILDINFO.txt 2>/dev/null || true
+            done
       - store_artifacts:
           path: images
           destination: images
+      - persist_to_workspace:
+          root: images
+          paths: ["*.zip", "SHA256SUMS-*.txt"]
+
+  release:
+    docker:
+      - image: cimg/base:2024.02
+    steps:
+      - attach_workspace:
+          at: images
+      - run:
+          name: Combine checksums
+          command: cat images/SHA256SUMS-*.txt > images/SHA256SUMS.txt
+      - run:
+          name: Install GitHub CLI
+          command: |
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list
+            sudo apt-get update -qq && sudo apt-get install -y gh
+      - run:
+          name: Create GitHub Release
+          # Requires a GITHUB_TOKEN with `repo` scope set in a CircleCI
+          # context or project environment variable.
+          command: |
+            gh release create "${CIRCLE_TAG}" images/*.zip images/SHA256SUMS.txt \
+              --repo "${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}" \
+              --generate-notes
 
 workflows:
   # Runs on every push/PR: fast lint + builder-image build only.
@@ -138,3 +198,37 @@ workflows:
           name: build-base
           de: base
           requires: [build-builder-image]
+
+  # Tag push (v1.2.3 etc.): full build of all three images, then publish a
+  # GitHub Release with the zips + combined checksums attached. Needs a
+  # GITHUB_TOKEN (repo scope) set as a project environment variable or in
+  # a context this workflow's jobs can access.
+  release-build:
+    jobs:
+      - lint:
+          filters: &tags-only
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/
+      - build-builder-image:
+          requires: [lint]
+          filters: *tags-only
+      - build-image:
+          name: build-plasma
+          de: plasma
+          requires: [build-builder-image]
+          filters: *tags-only
+      - build-image:
+          name: build-gnome
+          de: gnome
+          requires: [build-builder-image]
+          filters: *tags-only
+      - build-image:
+          name: build-base
+          de: base
+          requires: [build-builder-image]
+          filters: *tags-only
+      - release:
+          requires: [build-plasma, build-gnome, build-base]
+          filters: *tags-only

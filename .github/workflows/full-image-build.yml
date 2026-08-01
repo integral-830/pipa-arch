@@ -1,0 +1,143 @@
+name: Full image build
+
+# Real `make plasma|gnome|base` runs: --privileged Docker, loop devices,
+# mkfs, mount --bind, aarch64 emulation, live pulls against the upstream
+# pipa-pkgs / pipa-alarm mirrors. Takes 30-90+ minutes per image (see
+# README), so this never runs on a plain push/PR -- only:
+#   - manually, with your choice of image(s) and build variables
+#   - automatically when you push a version tag (also cuts a GH Release)
+#   - on a weekly schedule, as a canary against the upstream repos, which
+#     have had outages before
+
+on:
+  workflow_dispatch:
+    inputs:
+      de:
+        description: "Image(s) to build"
+        required: true
+        default: all
+        type: choice
+        options: [all, plasma, gnome, base]
+      pipa_include_sensors:
+        description: "Include sensor packages"
+        required: false
+        default: "1"
+        type: string
+      pipa_include_extras:
+        description: "Include box64/gamescope/wine-aarch64/etc"
+        required: false
+        default: "1"
+        type: string
+  push:
+    tags:
+      - "v*"
+  schedule:
+    - cron: "0 4 * * 1" # weekly, Monday 04:00 UTC
+
+concurrency:
+  group: full-image-build-${{ github.ref }}
+  cancel-in-progress: false # never cancel a build already 40 minutes in
+
+jobs:
+  build:
+    name: Build ${{ matrix.de }} image
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        de: >-
+          ${{
+            github.event_name != 'workflow_dispatch' && fromJSON('["plasma","gnome","base"]')
+            || github.event.inputs.de == 'all' && fromJSON('["plasma","gnome","base"]')
+            || fromJSON(format('["{0}"]', github.event.inputs.de))
+          }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (aarch64 binfmt, needed for arch-chroot in pacstrap)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # Hosted runners have ~14GB free on the root disk, which is not
+      # enough headroom for a kernel + full desktop pacstrap plus the
+      # builder image itself. Reclaim space from preinstalled toolchains
+      # this job doesn't use, and move Docker's data-root onto the
+      # larger /mnt volume that GitHub-hosted Linux runners mount.
+      - name: Free up disk space
+        run: |
+          echo "Before:" && df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo docker system prune -af || true
+
+          sudo systemctl stop docker
+          sudo mkdir -p /mnt/docker-data
+          echo '{"data-root": "/mnt/docker-data"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          echo "After:" && df -h /
+
+      - name: Build ${{ matrix.de }} image
+        run: |
+          mkdir -p images
+          make "${{ matrix.de }}" \
+            BUILD_GIT_REV="${{ github.sha }}" \
+            PIPA_INCLUDE_SENSORS="${{ github.event.inputs.pipa_include_sensors || '1' }}" \
+            PIPA_INCLUDE_EXTRAS="${{ github.event.inputs.pipa_include_extras || '1' }}"
+
+      - name: Verify output
+        run: |
+          shopt -s nullglob
+          zips=(images/*.zip)
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "::error::No .zip produced in images/ -- build did not complete"
+            exit 1
+          fi
+          for z in "${zips[@]}"; do
+            echo "--- $z ---"
+            unzip -l "$z"
+          done
+
+      - name: Checksum + BUILDINFO
+        run: |
+          cd images
+          sha256sum *.zip | tee SHA256SUMS-${{ matrix.de }}.txt
+          for z in *.zip; do
+            unzip -p "$z" BUILDINFO.txt 2>/dev/null || true
+          done
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipa-arch-${{ matrix.de }}-${{ github.sha }}
+          path: |
+            images/*.zip
+            images/SHA256SUMS-*.txt
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all image artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: images
+          pattern: pipa-arch-*
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: cat images/SHA256SUMS-*.txt > images/SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            images/*.zip
+            images/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
