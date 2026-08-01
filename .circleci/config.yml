@@ -7,6 +7,15 @@ version: 2.1
 # this too). Full builds also take 30-90+ minutes per the README, so they
 # run only via manual approval, the nightly scheduled pipeline, or a tag
 # push (which also cuts a GitHub Release) -- never on every commit.
+#
+# linux-vm below uses ubuntu-2404:current + resource_class: medium: the
+# current LTS machine image and the one resource class every CircleCI plan
+# gets without needing approval from support (xlarge/large.gen2/etc. are
+# gated behind plan tier or an approval request -- see
+# https://support.circleci.com/hc/en-us/articles/53295013820187). If your
+# plan does have a bigger class enabled, bump resource_class below (e.g.
+# large or large.gen2) to speed the full builds up -- medium is 2 vCPU/8GB,
+# which will work but isn't fast for a kernel + desktop pacstrap.
 # ---------------------------------------------------------------------------
 
 parameters:
@@ -24,8 +33,8 @@ executors:
     resource_class: medium
   linux-vm:
     machine:
-      image: ubuntu-2204:current
-    resource_class: xlarge
+      image: ubuntu-2404:current
+    resource_class: medium
 
 jobs:
   lint:
