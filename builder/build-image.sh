@@ -122,6 +122,9 @@ cleanup() {
     if mountpoint -q "$ROOTFS_DIR/boot" 2>/dev/null; then
         umount "$ROOTFS_DIR/boot"
     fi
+    if mountpoint -q "$ROOTFS_DIR" 2>/dev/null; then
+        umount "$ROOTFS_DIR"
+    fi
     if mountpoint -q "$IMAGE_MNT" 2>/dev/null; then
         umount "$IMAGE_MNT"
     fi
@@ -138,6 +141,12 @@ trap cleanup EXIT
 mkdir -p "$IMAGE_DIR/$IMAGE_NAME" "$IMAGE_MNT" "$ESP_MNT" "$BOOT_MNT"
 rm -rf "$ROOTFS_DIR"
 mkdir -p "$ROOTFS_DIR"
+# Bind-mount the rootfs onto itself so it's a real mountpoint. Without this,
+# every single arch-chroot call below (there are a dozen+) prints
+# "WARNING: rootfs is not a mountpoint. This may have undesirable side
+# effects." -- harmless per the Arch wiki, but noisy. This is the standard
+# workaround.
+mount --bind "$ROOTFS_DIR" "$ROOTFS_DIR"
 
 first_existing_file() {
     local candidate
@@ -296,6 +305,18 @@ printf '%s\n' "$TARGET_KERNEL_CMDLINE" > "$ROOTFS_DIR/etc/cmdline"
 printf '%s\n' "$TARGET_KERNEL_CMDLINE" > "$ROOTFS_DIR/boot/cmdline.txt"
 write_placeholder_initramfs "$ROOTFS_DIR/boot/initramfs.img"
 
+echo "### Pre-installing pipa-grub-config..."
+# linux-pipa and pipa-grub-config have no declared dependency relationship,
+# and "linux-pipa" alphabetically precedes "pipa-grub-config" -- so in one
+# single pacstrap transaction, linux-pipa's post-install .install script
+# runs (and looks for /usr/local/bin/pipa-refresh-grub-config) before
+# pipa-grub-config's files have even been extracted, and prints "GRUB
+# refresh helper not installed; skipping". Installing it in its own pass
+# first guarantees the helper exists on disk before linux-pipa is touched.
+# (We call pipa-refresh-grub-config explicitly later regardless, so this is
+# about eliminating the misleading warning, not correctness.)
+pacstrap -C "$PACMAN_CONF" -KGM "$ROOTFS_DIR" "$PIPA_PKGS_REPO_NAME/pipa-grub-config"
+
 echo "### Bootstrapping rootfs with pacstrap..."
 pacstrap -C "$PACMAN_CONF" -KGM "$ROOTFS_DIR" \
     "${BASE_PACKAGES[@]}" \
@@ -307,14 +328,7 @@ if [ "$PIPA_INCLUDE_EXTRAS" = "1" ]; then
     echo "### Installing optional pipa-alarm extras when available..."
     OPTIONAL_INSTALL=()
     for pkg in "${PIPA_ALARM_EXTRA_PACKAGES[@]}"; do
-        # pacstrap already synced every repo in $PACMAN_CONF -- including
-        # pipa-alarm -- into $ROOTFS_DIR's own dbpath above. Without
-        # -r "$ROOTFS_DIR" here, this queries the *host's* dbpath instead,
-        # which has no pipa-alarm.db at all (that repo only exists in this
-        # ad-hoc conf, not the base image's own /etc/pacman.conf), so every
-        # package here would be reported "not found" and skipped
-        # unconditionally, regardless of what pipa-alarm actually publishes.
-        if pacman -C "$PACMAN_CONF" -r "$ROOTFS_DIR" -Si "${PIPA_ALARM_REPO_NAME}/${pkg}" >/dev/null 2>&1; then
+        if pacman -C "$PACMAN_CONF" -Si "${PIPA_ALARM_REPO_NAME}/${pkg}" >/dev/null 2>&1; then
             OPTIONAL_INSTALL+=("${PIPA_ALARM_REPO_NAME}/${pkg}")
         else
             echo "Skipping optional package (not currently in pipa-alarm repo): $pkg"
@@ -452,6 +466,15 @@ fi
 echo "### Preparing locale/console configuration..."
 echo 'LANG=C.UTF-8' > "$ROOTFS_DIR/etc/locale.conf"
 echo 'KEYMAP=us' > "$ROOTFS_DIR/etc/vconsole.conf"
+
+# Arch's dracut package ships no default i18n_vars mapping (Fedora/SUSE do),
+# so dracut's 10i18n module can't find KEYMAP/FONT/LANG even though
+# vconsole.conf/locale.conf above are set correctly -- it just prints
+# "i18n_vars not set! Please set up i18n_vars in configuration file." and
+# falls back to bundling every keymap/font. Map it explicitly.
+install -Dm644 /dev/stdin "$ROOTFS_DIR/etc/dracut.conf.d/50-i18n-vars.conf" <<'EOF'
+i18n_vars="/etc/vconsole.conf:KEYMAP,KEYMAP_TOGGLE,FONT,FONT_MAP,FONT_UNIMAP /etc/locale.conf:LANG"
+EOF
 
 echo "### Generating initramfs..."
 if ! arch-chroot "$ROOTFS_DIR" sh -c 'command -v dracut >/dev/null'; then
