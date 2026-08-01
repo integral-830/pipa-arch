@@ -132,23 +132,47 @@ PIPA_ALARM_EXTRA_PACKAGES=(
     wine-aarch64
 )
 
+unmount_best_effort() {
+    # Try a normal unmount first, then a lazy unmount (detaches immediately,
+    # actual teardown happens once nothing references it anymore) if that's
+    # blocked -- e.g. by leftover /proc,/sys,/dev,/run bind-mount remnants
+    # from the last arch-chroot call, or a short-lived helper process (such
+    # as a temporary udevd dracut sometimes spawns) still holding a
+    # reference. Never fails the caller: this container is torn down right
+    # after this script exits regardless, so a stuck mount here has no
+    # effect on the already-written image, only on this container's own
+    # tidiness.
+    local target="$1"
+    umount "$target" 2>/dev/null && return 0
+    umount -l "$target" 2>/dev/null && return 0
+    echo "Warning: could not unmount $target (leaving it for container teardown)" >&2
+    return 0
+}
+
 cleanup() {
+    # Capture the script's real exit status *before* running any cleanup
+    # commands, and explicitly re-exit with it at the end. Without this, a
+    # failing command inside this EXIT trap (e.g. a "target is busy"
+    # umount) becomes the script's own exit status under `set -e` --
+    # turning an otherwise fully successful build into a reported failure.
+    local exit_status=$?
     if mountpoint -q "$ROOTFS_DIR/boot" 2>/dev/null; then
-        umount "$ROOTFS_DIR/boot"
+        unmount_best_effort "$ROOTFS_DIR/boot"
     fi
     if mountpoint -q "$ROOTFS_DIR" 2>/dev/null; then
-        umount "$ROOTFS_DIR"
+        unmount_best_effort "$ROOTFS_DIR"
     fi
     if mountpoint -q "$IMAGE_MNT" 2>/dev/null; then
-        umount "$IMAGE_MNT"
+        unmount_best_effort "$IMAGE_MNT"
     fi
     if mountpoint -q "$ESP_MNT" 2>/dev/null; then
-        umount "$ESP_MNT"
+        unmount_best_effort "$ESP_MNT"
     fi
     if mountpoint -q "$BOOT_MNT" 2>/dev/null; then
-        umount "$BOOT_MNT"
+        unmount_best_effort "$BOOT_MNT"
     fi
     rm -f "$PACMAN_CONF"
+    exit "$exit_status"
 }
 trap cleanup EXIT
 
