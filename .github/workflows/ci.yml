@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      de:
+        description: "Image(s) to build"
+        required: true
+        default: all
+        type: choice
+        options: [all, plasma, gnome, base]
+  schedule:
+    # Weekly canary build against upstream pipa-pkgs / pipa-alarm repos,
+    # since those repos have had outages before (see README).
+    - cron: "0 4 * * 1"
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Fast, cheap checks that run on every push/PR.
+  # ---------------------------------------------------------------------
+  lint:
+    name: Shellcheck + Dockerfile lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck build scripts
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: "."
+          severity: warning
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: builder/Dockerfile
+          # DL3008/DL3018 (pin apt/pacman package versions) don't apply
+          # cleanly to a rolling-release Arch base image.
+          ignore: DL3008,DL3018
+
+      - name: bash -n syntax check
+        run: |
+          bash -n builder/build-image.sh
+          bash -n scripts/build-from-source.sh
+
+      - name: make help sanity check
+        run: make help
+
+  # ---------------------------------------------------------------------
+  # Build (but don't run) the builder Docker image on every push/PR.
+  # This alone catches most breakage: pacman package renames/removals,
+  # base-image changes, COPY/permission mistakes, etc. -- without needing
+  # privileged mode, loop devices, or a 30-90 min pacstrap run.
+  # ---------------------------------------------------------------------
+  build-builder-image:
+    name: Build builder image (no image assembly)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (aarch64 emulation, needed by the ARM base image)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build builder image
+        uses: docker/build-push-action@v6
+        with:
+          context: builder
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: archlinux-pipa-builder:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test entrypoint (--help, no root/privileged needed)
+        run: |
+          docker run --rm --platform linux/arm64 archlinux-pipa-builder:ci --help
+
+  # ---------------------------------------------------------------------
+  # Full, real image builds. These need --privileged (loop devices, mkfs,
+  # mount --bind) and take 30-90+ minutes per README, so they're gated
+  # behind manual dispatch or the weekly canary schedule rather than
+  # running on every push/PR.
+  # ---------------------------------------------------------------------
+  build-images:
+    name: Build ${{ matrix.de }} image
+    runs-on: ubuntu-latest
+    needs: build-builder-image
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        de: >-
+          ${{
+            github.event_name == 'schedule' && fromJSON('["plasma","gnome","base"]')
+            || github.event.inputs.de == 'all' && fromJSON('["plasma","gnome","base"]')
+            || fromJSON(format('["{0}"]', github.event.inputs.de))
+          }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (aarch64 binfmt, for arch-chroot inside pacstrap)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker system prune -af || true
+
+      - name: Build ${{ matrix.de }} image
+        run: |
+          mkdir -p images
+          make ${{ matrix.de }} \
+            BUILD_GIT_REV="${{ github.sha }}"
+
+      - name: Checksum output
+        run: sha256sum images/*.zip || true
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipa-arch-${{ matrix.de }}-${{ github.sha }}
+          path: images/*.zip
+          retention-days: 14
+          if-no-files-found: error

@@ -1,0 +1,140 @@
+version: 2.1
+
+# ---------------------------------------------------------------------------
+# CircleCI can't do privileged Docker (loop devices, mkfs, mount --bind) on
+# the default `docker` executor, so full image assembly needs the `machine`
+# executor (a real VM, same reason GitHub Actions ubuntu-latest works for
+# this too). Full builds also take 30-90+ minutes per the README, so they
+# run only via manual approval or the nightly scheduled pipeline, not on
+# every commit.
+# ---------------------------------------------------------------------------
+
+executors:
+  docker-small:
+    docker:
+      - image: cimg/base:2024.02
+    resource_class: medium
+  linux-vm:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: xlarge
+
+jobs:
+  lint:
+    executor: docker-small
+    steps:
+      - checkout
+      - run:
+          name: Install shellcheck + hadolint
+          command: |
+            sudo apt-get update -qq
+            sudo apt-get install -y shellcheck
+            curl -sL -o /tmp/hadolint \
+              https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+            chmod +x /tmp/hadolint
+      - run:
+          name: bash -n syntax check
+          command: |
+            bash -n builder/build-image.sh
+            bash -n scripts/build-from-source.sh
+      - run:
+          name: shellcheck
+          command: shellcheck -S warning builder/build-image.sh scripts/build-from-source.sh
+      - run:
+          name: hadolint (Dockerfile)
+          command: /tmp/hadolint --ignore DL3008 --ignore DL3018 builder/Dockerfile
+      - run:
+          name: make help sanity check
+          command: make help
+
+  build-builder-image:
+    executor: linux-vm
+    steps:
+      - checkout
+      - run:
+          name: Register aarch64 binfmt (QEMU)
+          command: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+      - run:
+          name: Build builder image
+          command: docker build builder -t archlinux-pipa-builder:ci
+      - run:
+          name: Smoke-test entrypoint (--help)
+          command: docker run --rm archlinux-pipa-builder:ci --help
+
+  build-image:
+    parameters:
+      de:
+        type: enum
+        enum: ["plasma", "gnome", "base"]
+    executor: linux-vm
+    steps:
+      - checkout
+      - run:
+          name: Register aarch64 binfmt (QEMU)
+          command: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+      - run:
+          name: Free disk space
+          command: docker system prune -af || true
+      - run:
+          name: Build << parameters.de >> image
+          command: |
+            mkdir -p images
+            make << parameters.de >> BUILD_GIT_REV="${CIRCLE_SHA1}"
+          no_output_timeout: 90m
+      - run:
+          name: Checksum output
+          command: sha256sum images/*.zip || true
+      - store_artifacts:
+          path: images
+          destination: images
+
+workflows:
+  # Runs on every push/PR: fast lint + builder-image build only.
+  ci:
+    jobs:
+      - lint
+      - build-builder-image:
+          requires: [lint]
+      - hold-full-build:
+          type: approval
+          requires: [build-builder-image]
+      - build-image:
+          name: build-plasma
+          de: plasma
+          requires: [hold-full-build]
+      - build-image:
+          name: build-gnome
+          de: gnome
+          requires: [hold-full-build]
+      - build-image:
+          name: build-base
+          de: base
+          requires: [hold-full-build]
+
+  # Nightly canary against upstream pipa-pkgs / pipa-alarm repos, which
+  # have had outages before (see README). Configure this as a Scheduled
+  # Pipeline in the CircleCI project UI pointing at this workflow, or keep
+  # this trigger block if your project still uses the legacy scheduler.
+  nightly-full-build:
+    triggers:
+      - schedule:
+          cron: "0 4 * * *"
+          filters:
+            branches:
+              only: [main]
+    jobs:
+      - lint
+      - build-builder-image:
+          requires: [lint]
+      - build-image:
+          name: build-plasma
+          de: plasma
+          requires: [build-builder-image]
+      - build-image:
+          name: build-gnome
+          de: gnome
+          requires: [build-builder-image]
+      - build-image:
+          name: build-base
+          de: base
+          requires: [build-builder-image]
