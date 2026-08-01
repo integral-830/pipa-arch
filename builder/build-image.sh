@@ -95,10 +95,24 @@ BOOT_SIZE_MB=1024
 # qca-swiss-army-knife, usb-network. Pulling the meta-package instead of
 # hand-listing each one lets pacman's own dependency resolution stay correct
 # as pipa-pkgs updates versions.
+#
+# Two packages are NOT in pipa-metapkg's depends= despite being part of the
+# same hardware stack, confirmed by diffing it against pipa-metapkg's actual
+# PKGBUILD -- they must be listed explicitly or they silently never get
+# installed:
+#   - rmtfs: the Qualcomm Remote Filesystem Service that the SDSP/sensor
+#     subsystem's calibration persistence (pipa-sensors-persist) rides on.
+#     Its absence is the most likely cause of sensors not working, since
+#     `systemctl enable ... rmtfs` was silently succeeding-as-a-no-op
+#     against a service file that was never on disk.
+#   - alsa-ucm-conf-sm8250: device-specific audio UCM profiles (distinct
+#     from the generic `alsa-ucm-conf` in BASE_PACKAGES above).
 PIPA_META_PACKAGES=(pipa-metapkg)
 PIPA_CORE_PACKAGES=(
     linux-pipa
     pipa-kernel-flasher-hook
+    rmtfs
+    alsa-ucm-conf-sm8250
 )
 if [ "$PIPA_INCLUDE_SENSORS" = "1" ]; then
     PIPA_CORE_PACKAGES+=(hexagonrpc iio-sensor-proxy)
@@ -119,53 +133,33 @@ PIPA_ALARM_EXTRA_PACKAGES=(
 )
 
 cleanup() {
-    # Preserve whatever the script actually exited with -- bash overrides
-    # the script's exit status with the *last* command run inside an EXIT
-    # trap, so an unrelated, transient busy-umount here must never turn a
-    # successful build into a reported failure.
-    local exit_code=$?
-
     if mountpoint -q "$ROOTFS_DIR/boot" 2>/dev/null; then
-        umount "$ROOTFS_DIR/boot" 2>/dev/null || umount -l "$ROOTFS_DIR/boot" 2>/dev/null || true
+        umount "$ROOTFS_DIR/boot"
+    fi
+    if mountpoint -q "$ROOTFS_DIR" 2>/dev/null; then
+        umount "$ROOTFS_DIR"
     fi
     if mountpoint -q "$IMAGE_MNT" 2>/dev/null; then
-        umount "$IMAGE_MNT" 2>/dev/null || umount -l "$IMAGE_MNT" 2>/dev/null || true
+        umount "$IMAGE_MNT"
     fi
     if mountpoint -q "$ESP_MNT" 2>/dev/null; then
-        umount "$ESP_MNT" 2>/dev/null || umount -l "$ESP_MNT" 2>/dev/null || true
+        umount "$ESP_MNT"
     fi
     if mountpoint -q "$BOOT_MNT" 2>/dev/null; then
-        umount "$BOOT_MNT" 2>/dev/null || umount -l "$BOOT_MNT" 2>/dev/null || true
-    fi
-    # Catch-all for anything arch-chroot's own per-invocation proc/sys/dev
-    # (and efivars) cleanup didn't release -- e.g. if a background process
-    # spawned inside a chroot (dbus/dconf helpers are common culprits) was
-    # still holding one open. -R handles nested submounts; -l (lazy) is the
-    # fallback if something is still transiently busy.
-    if mountpoint -q "$ROOTFS_DIR" 2>/dev/null; then
-        umount -R "$ROOTFS_DIR" 2>/dev/null || umount -l "$ROOTFS_DIR" 2>/dev/null || true
+        umount "$BOOT_MNT"
     fi
     rm -f "$PACMAN_CONF"
-
-    exit "$exit_code"
 }
 trap cleanup EXIT
 
 mkdir -p "$IMAGE_DIR/$IMAGE_NAME" "$IMAGE_MNT" "$ESP_MNT" "$BOOT_MNT"
-# A previous crashed run may have left $ROOTFS_DIR self-bind-mounted (see
-# below); clear that first or the rm -rf on the next line can itself hit a
-# busy mountpoint.
-if mountpoint -q "$ROOTFS_DIR" 2>/dev/null; then
-    umount -R "$ROOTFS_DIR" 2>/dev/null || umount -l "$ROOTFS_DIR" 2>/dev/null || true
-fi
 rm -rf "$ROOTFS_DIR"
 mkdir -p "$ROOTFS_DIR"
-
-# arch-chroot warns on every single invocation below if $ROOTFS_DIR isn't
-# itself a mountpoint (harmless, but it's dozens of invocations across this
-# script, so dozens of repeated warnings). Bind-mounting it onto itself is
-# the standard fix arch-chroot's own docs suggest; cleanup() above tears it
-# back down.
+# Bind-mount the rootfs onto itself so it's a real mountpoint. Without this,
+# every single arch-chroot call below (there are a dozen+) prints
+# "WARNING: rootfs is not a mountpoint. This may have undesirable side
+# effects." -- harmless per the Arch wiki, but noisy. This is the standard
+# workaround.
 mount --bind "$ROOTFS_DIR" "$ROOTFS_DIR"
 
 first_existing_file() {
@@ -205,6 +199,29 @@ assert_required_rootfs_libssc() {
         echo "Missing libssc shared library in target rootfs (expected libssc.so.0 or libssc.so.2)" >&2
         exit 1
     fi
+}
+
+require_and_enable() {
+    # Like `systemctl enable`, but fails loudly if the unit file doesn't
+    # exist in the rootfs instead of silently no-op'ing. The rmtfs.service
+    # gap (present in `systemctl enable` calls but never actually installed
+    # by any package pulled in) went unnoticed for a while specifically
+    # because these calls used to be blanket `|| true`.
+    local unit missing=()
+    for unit in "$@"; do
+        if ! first_existing_file \
+            "$ROOTFS_DIR/usr/lib/systemd/system/$unit" \
+            "$ROOTFS_DIR/etc/systemd/system/$unit" \
+            >/dev/null; then
+            missing+=("$unit")
+        fi
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo "Cannot enable missing systemd unit(s): ${missing[*]}" >&2
+        echo "(the package that should provide them was not installed -- check PIPA_CORE_PACKAGES / pipa-metapkg's depends=)" >&2
+        exit 1
+    fi
+    arch-chroot "$ROOTFS_DIR" systemctl enable "$@"
 }
 
 write_placeholder_initramfs() {
@@ -325,14 +342,64 @@ printf '%s\n' "$TARGET_KERNEL_CMDLINE" > "$ROOTFS_DIR/etc/cmdline"
 printf '%s\n' "$TARGET_KERNEL_CMDLINE" > "$ROOTFS_DIR/boot/cmdline.txt"
 write_placeholder_initramfs "$ROOTFS_DIR/boot/initramfs.img"
 
-# Must exist before pacstrap, not just before our own later explicit dracut
-# call: installing linux-pipa triggers its packaged post-install hook,
-# which runs dracut immediately. Without these, that first pass fails with
-# "dracut[E]: i18n_vars not set!" -- harmless since our later explicit
-# dracut --force regenerates it correctly, but avoidable noise.
-echo "### Preparing locale/console configuration..."
-echo 'LANG=C.UTF-8' > "$ROOTFS_DIR/etc/locale.conf"
-echo 'KEYMAP=us' > "$ROOTFS_DIR/etc/vconsole.conf"
+# pipa-grub-config ships a pacman hook (95-pipa-refresh-grub-config.hook)
+# that fires automatically on every install/upgrade of itself or
+# linux-pipa -- including during pacstrap below, long before the real boot
+# partition exists. Its helper script refuses to run unless /boot is an
+# actual mountpoint ("pipa-grub-config: /boot is not mounted; refusing to
+# write GRUB config"), and a failed pacman hook makes pacman -- and thus
+# pacstrap -- exit non-zero, which aborts this whole script under `set -e`.
+# Self-bind-mounting /boot satisfies that mountpoint check, so the
+# auto-triggered hook becomes a harmless no-op instead of a hard failure.
+# We explicitly regenerate the real GRUB config later, once the actual
+# boot partition is mounted in its place, so anything this early run
+# writes gets discarded anyway.
+mount --bind "$ROOTFS_DIR/boot" "$ROOTFS_DIR/boot"
+
+echo "### Pre-installing pipa-grub-config..."
+# linux-pipa and pipa-grub-config have no declared dependency relationship,
+# and "linux-pipa" alphabetically precedes "pipa-grub-config" -- so in one
+# single pacstrap transaction, linux-pipa's post-install .install script
+# runs (and looks for /usr/local/bin/pipa-refresh-grub-config) before
+# pipa-grub-config's files have even been extracted, and prints "GRUB
+# refresh helper not installed; skipping". Installing it in its own pass
+# first guarantees the helper exists on disk before linux-pipa is touched.
+# (We call pipa-refresh-grub-config explicitly later regardless, so this is
+# about eliminating the misleading warning, not correctness.)
+pacstrap -C "$PACMAN_CONF" -KGM "$ROOTFS_DIR" "$PIPA_PKGS_REPO_NAME/pipa-grub-config"
+
+echo "### Rebranding pipa-grub-config's GRUB menu (upstream hardcodes EndeavourOS)..."
+# pipa-pkgs' own pipa-refresh-grub-config script -- unrelated to anything in
+# this build system -- hardcodes menuentry "EndeavourOS ARM (Pipa) - ..."
+# and copies an EndeavourOS-branded GRUB theme (from the
+# grub2-theme-endeavouros-classic package pulled in by pipa-metapkg) when
+# present. The rootfs itself is vanilla Arch throughout -- this is a purely
+# cosmetic label + theme left over from that package's EndeavourOS-testing
+# origins. Patch it in place so the boot menu correctly says "Arch Linux"
+# and never picks up the EndeavourOS theme, regardless of whether that
+# theme package ends up installed as a pipa-metapkg dependency.
+GRUB_HELPER="$ROOTFS_DIR/usr/local/bin/pipa-refresh-grub-config"
+if [ ! -f "$GRUB_HELPER" ]; then
+    echo "Expected $GRUB_HELPER after pre-installing pipa-grub-config, but it's missing" >&2
+    exit 1
+fi
+sed -i 's/EndeavourOS ARM (Pipa)/Arch Linux ARM (Pipa)/' "$GRUB_HELPER"
+sed -i 's/^if \[ -d "\$eos_theme_src" \]; then$/if false; then/' "$GRUB_HELPER"
+sed -i 's/^elif \[ -d "\$eos_theme_dest" \]; then$/elif false; then/' "$GRUB_HELPER"
+# Verify functionally rather than with a blanket grep for "EndeavourOS" --
+# a couple of comment lines/dead branches referencing it are harmless and
+# expected to remain (has_eos_theme can now never become 1, so that code
+# never runs); what matters is the menu entry text and the theme gate.
+if grep -q 'EndeavourOS ARM (Pipa)' "$GRUB_HELPER"; then
+    echo "Rebranding pipa-refresh-grub-config failed -- menu entry still says EndeavourOS:" >&2
+    grep -n 'menuentry' "$GRUB_HELPER" >&2
+    exit 1
+fi
+if [ "$(grep -c '^if false; then$\|^elif false; then$' "$GRUB_HELPER")" -ne 2 ]; then
+    echo "Rebranding pipa-refresh-grub-config failed -- EndeavourOS theme gate not neutralized:" >&2
+    grep -n 'eos_theme' "$GRUB_HELPER" >&2
+    exit 1
+fi
 
 echo "### Bootstrapping rootfs with pacstrap..."
 pacstrap -C "$PACMAN_CONF" -KGM "$ROOTFS_DIR" \
@@ -345,14 +412,7 @@ if [ "$PIPA_INCLUDE_EXTRAS" = "1" ]; then
     echo "### Installing optional pipa-alarm extras when available..."
     OPTIONAL_INSTALL=()
     for pkg in "${PIPA_ALARM_EXTRA_PACKAGES[@]}"; do
-        # pacstrap already synced every repo in $PACMAN_CONF -- including
-        # pipa-alarm -- into $ROOTFS_DIR's own dbpath above. Without
-        # -r "$ROOTFS_DIR" here, this queries the *host's* dbpath instead,
-        # which has no pipa-alarm.db at all (that repo only exists in this
-        # ad-hoc conf, not the base image's own /etc/pacman.conf), so every
-        # package here would be reported "not found" and skipped
-        # unconditionally, regardless of what pipa-alarm actually publishes.
-        if pacman -C "$PACMAN_CONF" -r "$ROOTFS_DIR" -Si "${PIPA_ALARM_REPO_NAME}/${pkg}" >/dev/null 2>&1; then
+        if pacman -C "$PACMAN_CONF" -Si "${PIPA_ALARM_REPO_NAME}/${pkg}" >/dev/null 2>&1; then
             OPTIONAL_INSTALL+=("${PIPA_ALARM_REPO_NAME}/${pkg}")
         else
             echo "Skipping optional package (not currently in pipa-alarm repo): $pkg"
@@ -487,6 +547,19 @@ if [ -z "${DTB_IMAGE:-}" ] || [ ! -f "$DTB_IMAGE" ]; then
     exit 1
 fi
 
+echo "### Preparing locale/console configuration..."
+echo 'LANG=C.UTF-8' > "$ROOTFS_DIR/etc/locale.conf"
+echo 'KEYMAP=us' > "$ROOTFS_DIR/etc/vconsole.conf"
+
+# Arch's dracut package ships no default i18n_vars mapping (Fedora/SUSE do),
+# so dracut's 10i18n module can't find KEYMAP/FONT/LANG even though
+# vconsole.conf/locale.conf above are set correctly -- it just prints
+# "i18n_vars not set! Please set up i18n_vars in configuration file." and
+# falls back to bundling every keymap/font. Map it explicitly.
+install -Dm644 /dev/stdin "$ROOTFS_DIR/etc/dracut.conf.d/50-i18n-vars.conf" <<'EOF'
+i18n_vars="/etc/vconsole.conf:KEYMAP,KEYMAP_TOGGLE,FONT,FONT_MAP,FONT_UNIMAP /etc/locale.conf:LANG"
+EOF
+
 echo "### Generating initramfs..."
 if ! arch-chroot "$ROOTFS_DIR" sh -c 'command -v dracut >/dev/null'; then
     echo "dracut is required in the target rootfs but was not found" >&2
@@ -532,16 +605,16 @@ fi
 arch-chroot "$ROOTFS_DIR" systemctl enable NetworkManager sshd bluetooth systemd-resolved systemd-timesyncd
 arch-chroot "$ROOTFS_DIR" systemctl enable tuned tuned-ppd || true
 arch-chroot "$ROOTFS_DIR" systemctl enable bootmac-bluetooth || true
-arch-chroot "$ROOTFS_DIR" systemctl enable pd-mapper rmtfs tqftpserv || true
+require_and_enable pd-mapper.service rmtfs.service rmtfs-dir.service tqftpserv.service
 if [ "$PIPA_INCLUDE_SENSORS" = "1" ]; then
-    arch-chroot "$ROOTFS_DIR" systemctl enable \
-        pipa-sensors-persist \
-        hexagonrpcd-sdsp \
-        hexagonrpcd-adsp-sensorspd \
-        iio-sensor-proxy \
-        pipa-audio-init || true
+    require_and_enable \
+        pipa-sensors-persist.service \
+        hexagonrpcd-sdsp.service \
+        hexagonrpcd-adsp-sensorspd.service \
+        iio-sensor-proxy.service \
+        pipa-audio-init.service
 else
-    arch-chroot "$ROOTFS_DIR" systemctl enable pipa-audio-init || true
+    require_and_enable pipa-audio-init.service
 fi
 arch-chroot "$ROOTFS_DIR" systemctl mask hexagonrpcd-adsp-rootpd.service || true
 
@@ -639,6 +712,10 @@ else
     cp "$DTB_IMAGE" "$BOOT_MNT/dtbs/qcom/"
 fi
 printf '%s\n' "$TARGET_KERNEL_CMDLINE" > "$BOOT_MNT/cmdline.txt"
+# Drop the temporary self-bind-mount from earlier (used only so
+# pipa-grub-config's auto-triggered pacman hook wouldn't refuse to run
+# during pacstrap) before putting the real boot partition in its place.
+umount "$ROOTFS_DIR/boot"
 mount --move "$BOOT_MNT" "$ROOTFS_DIR/boot"
 arch-chroot "$ROOTFS_DIR" env \
     PIPA_INITRAMFS_SOURCE="/boot/initramfs-$KERNEL_VER.img" \
