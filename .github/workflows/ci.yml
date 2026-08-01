@@ -31,8 +31,11 @@ jobs:
         with:
           dockerfile: builder/Dockerfile
           # DL3008/DL3018 (pin apt/pacman package versions) don't apply
-          # cleanly to a rolling-release Arch base image.
-          ignore: DL3008,DL3018
+          # cleanly to a rolling-release Arch base image. DL3029 (don't pin
+          # --platform in FROM) is intentionally overridden: this image
+          # only works built as linux/arm64 regardless of host arch --
+          # see the comment above the FROM line in the Dockerfile.
+          ignore: DL3008,DL3018,DL3029
 
       - name: bash -n syntax check
         run: |

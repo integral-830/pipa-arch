@@ -62,7 +62,7 @@ check-docker:
 	@command -v docker >/dev/null || { echo "docker is required but not installed."; exit 1; }
 
 builder: check-docker
-	docker build $(BUILDER_DIR) -t $(BUILDER_IMAGE)
+	docker build --platform linux/arm64 $(BUILDER_DIR) -t $(BUILDER_IMAGE)
 
 $(IMAGES_DIR):
 	mkdir -p $(IMAGES_DIR)

@@ -50,7 +50,7 @@ jobs:
           command: shellcheck -S warning builder/build-image.sh scripts/build-from-source.sh
       - run:
           name: hadolint (Dockerfile)
-          command: /tmp/hadolint --ignore DL3008 --ignore DL3018 builder/Dockerfile
+          command: /tmp/hadolint --ignore DL3008 --ignore DL3018 --ignore DL3029 builder/Dockerfile
       - run:
           name: make help sanity check
           command: make help
